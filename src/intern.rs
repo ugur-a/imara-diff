@@ -66,6 +66,19 @@ impl<T: Eq + Hash> InternedInput<T> {
         res
     }
 
+    /// Create an Interner with an intial capacity calculated by calling
+    /// [`estimate_tokens`](crate::intern::TokenSource::estimate_tokens) methods of `before` and `after`
+    pub fn reserve_for_token_source<S: TokenSource<Token = T> + ?Sized>(&mut self, before: &S, after: &S) {
+        self.reserve(before.estimate_tokens(), after.estimate_tokens())
+    }
+
+    pub fn reserve(&mut self, capacity_before: u32, capacity_after: u32) {
+        self.before.reserve(capacity_before as usize);
+        self.after.reserve(capacity_after as usize);
+        self.interner
+            .reserve(capacity_before as usize + capacity_after as usize);
+    }
+
     /// replaces `self.before` wtih the iterned Tokens yielded by `input`
     /// Note that this does not erase any tokens from the interner and might therefore be considered
     /// a memory leak. If this function is called often over a long_running process
@@ -116,6 +129,19 @@ impl<T: Hash + Eq> Interner<T> {
             table: RawTable::with_capacity(capacity),
             hasher: RandomState::new(),
         }
+    }
+
+    /// Create an Interner with an intial capacity calculated by calling
+    /// [`estimate_tokens`](crate::intern::TokenSource::estimate_tokens) methods of `before` and `after`
+    pub fn reserve_for_token_source<S: TokenSource<Token = T>>(&mut self, before: &S, after: &S) {
+        self.reserve(before.estimate_tokens() as usize + after.estimate_tokens() as usize)
+    }
+
+    pub fn reserve(&mut self, capacity: usize) {
+        self.table.reserve(capacity, |&token| {
+            self.hasher.hash_one(&self.tokens[token.0 as usize])
+        });
+        self.tokens.reserve(capacity);
     }
 
     /// Remove all interned tokens

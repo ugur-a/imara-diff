@@ -46,3 +46,19 @@ pub fn sqrt(val: usize) -> u32 {
     let nbits = (usize::BITS - val.leading_zeros()) / 2;
     1 << nbits
 }
+
+pub fn find_hunk_end(changes: &[bool], pos: usize) -> usize {
+    pos + changes[pos..]
+        .iter()
+        .take_while(|&&changed| !changed)
+        .count()
+}
+
+pub fn find_hunk_start(changes: &[bool], pos: usize) -> usize {
+    pos - changes[..=pos]
+        .iter()
+        .rev()
+        .take_while(|&&changed| changed)
+        .count()
+        .saturating_sub(1)
+}

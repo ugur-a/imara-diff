@@ -150,16 +150,18 @@
 //! ```
 
 use std::hash::Hash;
-
-#[cfg(feature = "unified_diff")]
-pub use unified_diff::UnifiedDiffBuilder;
+use std::ops::Range;
+use std::slice;
 
 use crate::intern::{InternedInput, Token, TokenSource};
-pub use crate::sink::Sink;
+use crate::util::{strip_common_postfix, strip_common_prefix};
+#[cfg(feature = "unified_diff")]
+pub use unified_diff::{UnifiedDiff, UnifiedDiffConfig, UnifiedDiffPrinter};
+
 mod histogram;
 pub mod intern;
 mod myers;
-pub mod sink;
+pub mod postprocess;
 pub mod sources;
 #[cfg(feature = "unified_diff")]
 mod unified_diff;
@@ -236,46 +238,182 @@ impl Default for Algorithm {
     }
 }
 
-/// Computes an edit-script that transforms `input.before` into `input.after` using
-/// the specified `algorithm`
-/// The edit-script is passed to `sink.process_change` while it is produced.
-pub fn diff<S: Sink, T: Eq + Hash>(
-    algorithm: Algorithm,
-    input: &InternedInput<T>,
-    sink: S,
-) -> S::Out {
-    diff_with_tokens(
-        algorithm,
-        &input.before,
-        &input.after,
-        input.interner.num_tokens(),
-        sink,
-    )
+#[derive(Default, Debug)]
+pub struct Diff {
+    removed: Vec<bool>,
+    added: Vec<bool>,
 }
 
-/// Computes an edit-script that transforms `before` into `after` using
-/// the specified `algorithm`
-/// The edit-script is passed to `sink.process_change` while it is produced.
-pub fn diff_with_tokens<S: Sink>(
-    algorithm: Algorithm,
-    before: &[Token],
-    after: &[Token],
-    num_tokens: u32,
-    sink: S,
-) -> S::Out {
-    assert!(
-        before.len() < i32::MAX as usize,
-        "imara-diff only supports up to {} tokens",
-        i32::MAX
-    );
-    assert!(
-        after.len() < i32::MAX as usize,
-        "imara-diff only supports up to {} tokens",
-        i32::MAX
-    );
-    match algorithm {
-        Algorithm::Histogram => histogram::diff(before, after, num_tokens, sink),
-        Algorithm::Myers => myers::diff(before, after, num_tokens, sink, false),
-        Algorithm::MyersMinimal => myers::diff(before, after, num_tokens, sink, true),
+impl Diff {
+    /// Computes an edit-script that transforms `before` into `after` using
+    /// the specified `algorithm`.
+    pub fn compute<T: Eq + Hash>(algorithm: Algorithm, input: &InternedInput<T>) -> Diff {
+        Diff::default().compute_with(
+            algorithm,
+            &input.before,
+            &input.after,
+            input.interner.num_tokens(),
+        )
+    }
+
+    /// Computes an edit-script that transforms `before` into `after` using
+    /// the specified `algorithm`.
+    pub fn compute_with(
+        mut self,
+        algorithm: Algorithm,
+        mut before: &[Token],
+        mut after: &[Token],
+        num_tokens: u32,
+    ) -> Diff {
+        assert!(
+            before.len() < i32::MAX as usize,
+            "imara-diff only supports up to {} tokens",
+            i32::MAX
+        );
+        assert!(
+            after.len() < i32::MAX as usize,
+            "imara-diff only supports up to {} tokens",
+            i32::MAX
+        );
+        self.removed.clear();
+        self.added.clear();
+        self.removed.resize(before.len(), false);
+        self.added.resize(after.len(), false);
+        let common_prefix = strip_common_prefix(&mut before, &mut after) as usize;
+        let common_postfix = strip_common_postfix(&mut before, &mut after);
+        let range = common_prefix..self.removed.len() - common_postfix as usize;
+        let removed = &mut self.removed[range];
+        let range = common_prefix..self.added.len() - common_postfix as usize;
+        let added = &mut self.added[range];
+        match algorithm {
+            Algorithm::Histogram => histogram::diff(before, after, removed, added, num_tokens),
+            Algorithm::Myers => myers::diff(before, after, removed, added, false),
+            Algorithm::MyersMinimal => myers::diff(before, after, removed, added, true),
+        }
+        self
+    }
+
+    pub fn count_additions(&self) -> u32 {
+        self.added.iter().map(|&added| added as u32).sum()
+    }
+
+    pub fn count_removals(&self) -> u32 {
+        self.removed.iter().map(|&removed| removed as u32).sum()
+    }
+
+    pub fn is_removed(&self, token_idx: u32) -> bool {
+        self.removed[token_idx as usize]
+    }
+
+    pub fn is_added(&self, token_idx: u32) -> bool {
+        self.added[token_idx as usize]
+    }
+
+    /// Postprocesses the diff to make it more human readable. Certain bvhunks
+    /// have an amigous placement (event in a minimal diff) where they can move
+    /// downward or upward by removing a token (line) at the start and adding
+    /// one at the end (or the other way around). The postprocessing adjust
+    /// these hunks according to a coulple rules:
+    ///
+    /// * Always merge multiple hunks if possible.
+    /// * Move sliders as far down as possible.
+    pub fn postprocess<T: Eq + Hash>(&mut self, input: &InternedInput<T>) {
+        self.postprocess_with(&input.before, &input.after)
+    }
+
+    /// An iterator that yields the changed hunks in this diff
+    pub fn hunks(&self) -> HunkIter<'_> {
+        HunkIter {
+            removed: self.removed.iter(),
+            added: self.added.iter(),
+            pos_before: 0,
+            pos_after: 0,
+        }
+    }
+}
+
+/// A single change in a `Diff` that represents a range of tokens (`before`)
+/// in the first sequence that were replaced by a diffrerent range of tokens
+/// in the second sequence (`after`).
+///
+/// Tokens that are a
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Hunk {
+    pub before: Range<u32>,
+    pub after: Range<u32>,
+}
+
+impl Hunk {
+    /// Can be used instead of `Option::None` for better performance.
+    /// Because `imara-diff` does not support more then `i32::MAX` there is an unused bit pattern that can be used.
+    /// Has some nice properties where it usually is not necessary to check for `None` seperatly:
+    /// Empty ranges fail contains checks and also faills smaller then checks.
+    pub const NONE: Hunk = Hunk {
+        before: u32::MAX..u32::MAX,
+        after: u32::MAX..u32::MAX,
+    };
+
+    /// Inverts a hunk so that it represents a change
+    /// that would undo this hunk.
+    pub fn invert(&self) -> Hunk {
+        Hunk {
+            before: self.after.clone(),
+            after: self.before.clone(),
+        }
+    }
+
+    /// Returns whether tokens are only inserted and not removed in this hunk.
+    pub fn is_pure_insertion(&self) -> bool {
+        self.before.is_empty()
+    }
+
+    /// Returns whether tokens are only removed and not remved in this hunk.
+    pub fn is_pure_removal(&self) -> bool {
+        self.after.is_empty()
+    }
+}
+
+/// Yields all [`Hunk`]s in a file in montonically increasing order.
+/// Montonically increasing means here that the following holds for any two
+/// consequtive [`Hunk`]s `x` and `y`:
+///
+/// ``` no_compile
+/// assert!(x.before.end < y.before.start);
+/// assert!(x.after.end < y.after.start);
+/// ```
+///
+pub struct HunkIter<'diff> {
+    removed: slice::Iter<'diff, bool>,
+    added: slice::Iter<'diff, bool>,
+    pos_before: u32,
+    pos_after: u32,
+}
+
+impl Iterator for HunkIter<'_> {
+    type Item = Hunk;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let removed = (&mut self.removed).take_while(|&&removed| removed).count() as u32;
+            let added = (&mut self.added).take_while(|&&added| added).count() as u32;
+            if removed != 0 || added != 0 {
+                let start_before = self.pos_before;
+                let start_after = self.pos_after;
+                self.pos_before += removed;
+                self.pos_after += added;
+                let hunk = Hunk {
+                    before: start_before..self.pos_before,
+                    after: start_after..self.pos_after,
+                };
+                self.pos_before += 1;
+                self.pos_after += 1;
+                return Some(hunk);
+            } else if self.removed.len() == 0 && self.added.len() == 0 {
+                return None;
+            } else {
+                self.pos_before += 1;
+                self.pos_after += 1;
+            }
+        }
     }
 }
